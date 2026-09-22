@@ -2054,23 +2054,23 @@ subroutine check_config_feasibility()
     character(len=256) :: string
     logical :: error
 
-    ! Check that CFD and MD domains agree in x and z directions
-    rtoler = 1.d-4
-    rval = 0.d0
-    error = .false.
-    rval = rval + abs(xL_md - xL_cfd)
-    if (rval .gt. rtoler) error = .true.
-    rval = rval + abs(zL_md - zL_cfd)
-    if (rval .gt. rtoler) error = .true.
-    if (error) then
-        string = "CPL_create_map error - MD/CFD domain sizes do not match in both x and z "   // &
-                 "directions. Aborting simulation. "
-        print*, "xL_md = ",  xL_md
-        print*, "xL_cfd = ", xL_cfd
-        print*, "zL_md = ",  zL_md
-        print*, "zL_cfd = ", zL_cfd
-        call error_abort(string)
-    end if
+    ! ! Check that CFD and MD domains agree in x and z directions
+    ! rtoler = 1.d-4
+    ! rval = 0.d0
+    ! error = .false.
+    ! rval = rval + abs(xL_md - xL_cfd)
+    ! if (rval .gt. rtoler) error = .true.
+    ! rval = rval + abs(zL_md - zL_cfd)
+    ! if (rval .gt. rtoler) error = .true.
+    ! if (error) then
+    !     string = "CPL_create_map error - MD/CFD domain sizes do not match in both x and z "   // &
+    !              "directions. Aborting simulation. "
+    !     print*, "xL_md = ",  xL_md
+    !     print*, "xL_cfd = ", xL_cfd
+    !     print*, "zL_md = ",  zL_md
+    !     print*, "zL_cfd = ", zL_cfd
+    !     call error_abort(string)
+    ! end if
 
 
     !Check CFD and MD cell range
@@ -2129,12 +2129,13 @@ subroutine check_config_feasibility()
 
     ! Check whether ncx,ncy,ncz are an integer multiple of npx_md, etc.
     ! - N.B. no need to check ncy/npy_md.
+    ! and ncx_olap/npx_md, ncz_olap/npz_md
     ival = 0
     ival = ival + mod(ncx,npx_cfd)
     ival = ival + mod(ncy,npy_cfd)
     ival = ival + mod(ncz,npz_cfd)
-    ival = ival + mod(ncx,npx_md)
-    ival = ival + mod(ncz,npz_md)
+    ival = ival + mod(ncx_olap,npx_md)
+    ival = ival + mod(ncz_olap,npz_md)
     if (ival.ne.0) then 
 
         string = "CPL_create_map error - The number of cells in the cfd domain is not an "    // &
@@ -2272,9 +2273,11 @@ subroutine get_md_cell_ranges()
     implicit none
 
     integer :: n
-    integer :: olap_jmin_mdproc
+     integer :: olap_imin_mdproc, olap_jmin_mdproc, olap_kmin_mdproc
     integer :: ncxl, ncyl, nczl
+    integer :: ncx_mdonly, ncx_md, ncxP_md
     integer :: ncy_mdonly, ncy_md, ncyP_md
+    integer :: ncz_mdonly, ncz_md, nczP_md
     integer :: funit
 
     allocate(icPmin_md(npx_md)); icPmin_md = VOID
@@ -2285,11 +2288,23 @@ subroutine get_md_cell_ranges()
     allocate(kcPmax_md(npz_md)); kcPmax_md = VOID
 
     ! - - x - -
-    ncxl = ceiling(dble(ncx)/dble(npx_md))
-    do n=1,npx_md
-        icPmax_md(n) = n * ncxl
-        icPmin_md(n) = icPmax_md(n) - ncxl + 1
-    end do  
+    if (ncx_olap .eq. ncx) then
+        ncxl = ceiling(dble(ncx)/dble(npx_md))
+        do n=1,npx_md
+            icPmax_md(n) = n * ncxl
+            icPmin_md(n) = icPmax_md(n) - ncxl + 1
+        end do  
+    else
+        ncx_md     = nint(xL_md/dx)
+        ncx_mdonly = ncx_md - ncx_olap
+        ncxP_md    = ncx_md / npx_md
+        olap_imin_mdproc = npx_md - ceiling(dble(ncx_olap)/dble(ncxP_md)) + 1
+        do n = olap_imin_mdproc,npx_md
+            icPmax_md(n) = n * ncxP_md - ncx_mdonly
+            icPmin_md(n) = icPmax_md(n) - ncxP_md + 1
+            if (icPmin_md(n).le.0) icPmin_md(n) = 1
+        end do  
+    endif 
 
     ! - - y - -
     if (CPL_full_overlap) then
@@ -2311,11 +2326,23 @@ subroutine get_md_cell_ranges()
     endif
 
     ! - - z - -
-    nczl = ceiling(dble(ncz)/dble(npz_md))
-    do n=1,npz_md
-        kcPmax_md(n) = n * nczl
-        kcPmin_md(n) = kcPmax_md(n) - nczl + 1
-    end do
+    if (ncz_olap .eq. ncz) then
+        nczl = ceiling(dble(ncz)/dble(npz_md))
+        do n=1,npz_md
+            kcPmax_md(n) = n * nczl
+            kcPmin_md(n) = kcPmax_md(n) - nczl + 1
+        end do
+    else
+        ncz_md     = nint(zL_md/dz)
+        ncz_mdonly = ncz_md - ncz_olap
+        nczP_md    = ncz_md / npz_md
+        olap_kmin_mdproc = npz_md - ceiling(dble(ncz_olap)/dble(nczP_md)) + 1
+        do n = olap_kmin_mdproc,npz_md
+            kcPmax_md(n) = n * nczP_md - ncz_mdonly
+            kcPmin_md(n) = kcPmax_md(n) - nczP_md + 1
+            if (kcPmin_md(n).le.0) kcPmin_md(n) = 1
+        end do
+    endif
 
     if (myid_world .eq. rootid_world) then
 
@@ -2405,10 +2432,10 @@ subroutine get_overlap_blocks()
 !
     implicit none
 
-    integer             :: i,n,endproc,nolapsx,nolapsy,nolapsz
+    integer :: i,n,endproc,endprocx,endprocz,nolapsx,nolapsy,nolapsz
     integer :: funit
 
-    real(kind(0.d0))    :: xLl_md, yLl_md, zLl_md, yLl_cfd
+    real(kind(0.d0))    :: xLl_md, yLl_md, zLl_md, xLl_cfd, yLl_cfd, zLl_cfd
 
     xL_olap = ncx_olap * dx 
     yL_olap = ncy_olap * dy 
@@ -2422,13 +2449,23 @@ subroutine get_overlap_blocks()
         xLl = xLl_md; yLl = yLl_md ; zLl = zLl_md 
     endif
 
-    nolapsx = nint( dble( npx_md ) / dble( npx_cfd ) )
+    if (ncx_olap .eq. ncx) then
+        nolapsx = nint( dble( npx_md ) / dble( npx_cfd ) )
+    else
+        nolapsx = ceiling ( xL_olap / xLl_md )
+    endif
+
     if (CPL_full_overlap) then
         nolapsy = nint( dble( npy_md ) / dble( npy_cfd ) )
     else
         nolapsy = ceiling ( yL_olap / yLl_md ) 
     endif
-    nolapsz = nint( dble( npz_md ) / dble( npz_cfd ) )
+
+    if (ncz_olap .eq. ncz) then
+        nolapsz = nint( dble( npz_md ) / dble( npz_cfd ) )
+    else
+        nolapsz = ceiling ( zL_olap / zLl_md )
+    endif
 
     !Get cartesian coordinate of overlapping md cells & cfd cells
     allocate(cfd_icoord2olap_md_icoords(npx_cfd,nolapsx)) 
@@ -2439,11 +2476,27 @@ subroutine get_overlap_blocks()
     cfd_kcoord2olap_md_kcoords = VOID
 
     ! - - x - -
-    do n = 1,npx_cfd
-    do i = 1,nolapsx    
-        cfd_icoord2olap_md_icoords(n,i) = (n-1)*nolapsx + i
-    end do
-    end do
+    if (ncx_olap .eq. ncx) then
+        do n = 1,npx_cfd
+        do i = 1,nolapsx    
+            cfd_icoord2olap_md_icoords(n,i) = (n-1)*nolapsx + i
+        end do
+        end do
+    else
+        xLl_cfd = xL_cfd/npx_cfd
+        endprocx = ceiling(xL_olap/xLl_cfd)
+        if (endprocx .gt. npx_cfd) then
+            print*, "get_overlap_blocks warning - top CFD processor in x exceeds npx_cfd."
+            endprocx = npx_cfd
+            nolapsx = 1
+        endif
+        do n = 1,endprocx
+        do i = 1,nolapsx
+            cfd_icoord2olap_md_icoords(n,i) =   (n-1)*nolapsx + i &
+                                              + (npx_md - nolapsx)
+        end do
+        end do
+    endif
 
     ! - - y - -
     if (CPL_full_overlap) then
@@ -2471,13 +2524,28 @@ subroutine get_overlap_blocks()
         end do
     endif
 
-
     ! - - z - -
-    do n = 1,npz_cfd
-    do i = 1,nolapsz    
-        cfd_kcoord2olap_md_kcoords(n,i) = (n-1)*nolapsz + i
-    end do
-    end do
+    if (ncz_olap .eq. ncz) then
+        do n = 1,npz_cfd
+        do i = 1,nolapsz    
+            cfd_kcoord2olap_md_kcoords(n,i) = (n-1)*nolapsz + i
+        end do
+        end do
+    else
+        zLl_cfd = zL_cfd/npz_cfd
+        endprocz = ceiling(zL_olap/zLl_cfd)
+        if (endprocz .gt. npz_cfd) then
+            print*, "get_overlap_blocks warning - top CFD processor in z exceeds npz_cfd."
+            endprocz = npz_cfd
+            nolapsz = 1
+        endif
+        do n = 1,endprocz
+        do i = 1,nolapsz
+            cfd_kcoord2olap_md_kcoords(n,i) =   (n-1)*nolapsz + i &
+                                              + (npz_md - nolapsz)
+        end do
+        end do
+    endif
 
 
     if (myid_world .eq. rootid_world) then 
@@ -3112,40 +3180,6 @@ subroutine write_matrix(a,varname,fh)
     end do
 
 end subroutine write_matrix
-
-!===========================================================================
-! Subroutine that can be used to stop the code when reaching a given 
-! point in coupler -- useful when coupling new codes
-!---------------------------------------------------------------------------
-!subroutine request_stop(tag)
-!    use mpi
-!    implicit none
-!
-!    character(len=*),intent(in) ::tag
-!    integer myid, ierr
-!
-!    ! do nothing, get out quick 
-!    if(.not. stop_request_activated ) return
-!
-!    if (tag /= stop_request_name) return
-!
-!    select case(stop_request_name)
-!    case("create_comm","CREATE_COMM")
-!        call mpi_comm_rank(CPL_REALM_COMM, myid,ierr)
-!        write(0,*) 'stop as requested at ', trim(stop_request_name), ', realm',realm, 'rank', myid
-!        call MPI_Finalize(ierr)
-!        stop
-!    case("create_map","CREATE_MAP")
-!        call mpi_comm_rank(CPL_REALM_COMM, myid,ierr)
-!        write(0,*) 'stop as requested at ', trim(stop_request_name), ', realm',realm, 'rank', myid
-!        call MPI_Finalize(ierr)
-!        stop    
-!    case default
-!        write(0,*) "WARNING: request abort activated, but the tag is unrecognized, check COUPLER.in"
-!        write(0,*) "         accepted stop tags are: create_comm"
-!    end select
-!
-!end subroutine request_stop
 
 function CPL_new_fileunit() result (f)
     implicit none
