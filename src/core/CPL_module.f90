@@ -2454,12 +2454,18 @@ subroutine get_overlap_blocks()
     else
         nolapsx = ceiling ( xL_olap / xLl_md )
     endif
+
     if (CPL_full_overlap) then
         nolapsy = nint( dble( npy_md ) / dble( npy_cfd ) )
     else
         nolapsy = ceiling ( yL_olap / yLl_md ) 
     endif
-    nolapsz = nint( dble( npz_md ) / dble( npz_cfd ) )
+
+    if (ncz_olap .eq. ncz) then
+        nolapsz = nint( dble( npz_md ) / dble( npz_cfd ) )
+    else
+        nolapsz = ceiling ( zL_olap / zLl_md )
+    endif
 
     !Get cartesian coordinate of overlapping md cells & cfd cells
     allocate(cfd_icoord2olap_md_icoords(npx_cfd,nolapsx)) 
@@ -2470,7 +2476,7 @@ subroutine get_overlap_blocks()
     cfd_kcoord2olap_md_kcoords = VOID
 
     ! - - x - -
-    f (ncx_olap .eq. ncx) then
+    if (ncx_olap .eq. ncx) then
         do n = 1,npx_cfd
         do i = 1,nolapsx    
             cfd_icoord2olap_md_icoords(n,i) = (n-1)*nolapsx + i
@@ -2518,14 +2524,6 @@ subroutine get_overlap_blocks()
         end do
     endif
 
-
-    ! - - z - -
-    if (ncz_olap .eq. ncz) then
-        nolapsz = nint( dble( npz_md ) / dble( npz_cfd ) )
-    else
-        nolapsz = ceiling ( zL_olap / zLl_md )
-    endif
-    ...
     ! - - z - -
     if (ncz_olap .eq. ncz) then
         do n = 1,npz_cfd
@@ -3182,40 +3180,6 @@ subroutine write_matrix(a,varname,fh)
     end do
 
 end subroutine write_matrix
-
-!===========================================================================
-! Subroutine that can be used to stop the code when reaching a given 
-! point in coupler -- useful when coupling new codes
-!---------------------------------------------------------------------------
-!subroutine request_stop(tag)
-!    use mpi
-!    implicit none
-!
-!    character(len=*),intent(in) ::tag
-!    integer myid, ierr
-!
-!    ! do nothing, get out quick 
-!    if(.not. stop_request_activated ) return
-!
-!    if (tag /= stop_request_name) return
-!
-!    select case(stop_request_name)
-!    case("create_comm","CREATE_COMM")
-!        call mpi_comm_rank(CPL_REALM_COMM, myid,ierr)
-!        write(0,*) 'stop as requested at ', trim(stop_request_name), ', realm',realm, 'rank', myid
-!        call MPI_Finalize(ierr)
-!        stop
-!    case("create_map","CREATE_MAP")
-!        call mpi_comm_rank(CPL_REALM_COMM, myid,ierr)
-!        write(0,*) 'stop as requested at ', trim(stop_request_name), ', realm',realm, 'rank', myid
-!        call MPI_Finalize(ierr)
-!        stop    
-!    case default
-!        write(0,*) "WARNING: request abort activated, but the tag is unrecognized, check COUPLER.in"
-!        write(0,*) "         accepted stop tags are: create_comm"
-!    end select
-!
-!end subroutine request_stop
 
 function CPL_new_fileunit() result (f)
     implicit none
