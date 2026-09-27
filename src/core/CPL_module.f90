@@ -177,6 +177,20 @@ module coupler_module
         ncy_olap,         &    ! Number of cells in y in overlap region
         ncz_olap               ! Number of cells in z in overlap region
 
+    ! Periodic overlap-region extent update (grow/shrink the overlap region
+    ! while the simulation is running)
+    ! applied symmetrically to both the min and max bound in every direction, 
+    ! i.e. the physical change per update is k*dx, k*dy and k*dz in x, y and z.
+    logical, protected :: olap_update_active = .false.  ! True if OVERLAP_UPDATE was specified in COUPLER.in
+    integer, protected :: &
+          olap_update_n,    &    ! Number of CFD timesteps between overlap-extent updates
+          olap_update_k          ! Number of CFD cells to grow(+)/shrink(-) the overlap extents by
+    integer :: & 
+          olap_update_step_count = 0   ! Internal count of CFD timesteps since last update
+    logical :: & 
+          CPL_map_created = .false.    ! True once CPL_create_map has completed at least once
+    ! (i.e. it is safe for CPL_update_overlap_extents to free and rebuild the overlap communicators)
+
     ! Constrained dynamics region flags and params
     integer, protected :: &
         constraint_algo,  &
@@ -197,6 +211,34 @@ module coupler_module
         jcmax_bnry,       &   ! Region used to get boundary condition upper cell extents in y
         kcmin_bnry,       &   ! Region used to get boundary condition lower cell extents in z   
         kcmax_bnry            ! Region used to get boundary condition upper cell extents in z
+
+    ! Original overlap extents, recorded once by CPL_create_map. 
+    ! Used as the reference against which the constrained and boundary regions' relative position/size
+    ! within the overlap band is measured, so that CPL_update_overlap_extents
+    ! can preserve the same relative geometry when the overlap is resized.
+    integer :: &
+        icmin_olap0, icmax_olap0, &
+        jcmin_olap0, jcmax_olap0, &
+        kcmin_olap0, kcmax_olap0
+
+    ! Fractional position of the constrained region's bounds within
+    ! the original overlap band in each direction (0 = at icmin_olap0 etc.,
+    ! 1 = at icmax_olap0 etc.), recorded once by CPL_create_map
+    real(kind(0.d0)) :: &
+        frac_icmin_cnst, frac_icmax_cnst, &
+        frac_jcmin_cnst, frac_jcmax_cnst, &
+        frac_kcmin_cnst, frac_kcmax_cnst
+
+    ! Same, for the boundary region
+    real(kind(0.d0)) :: &
+        frac_icmin_bnry, frac_icmax_bnry, &
+        frac_jcmin_bnry, frac_jcmax_bnry, &
+        frac_kcmin_bnry, frac_kcmax_bnry
+
+    ! Original cell counts of the constrained and boundary regions 
+    ! in each direction, recorded once by CPL_create_map.
+    integer :: ncx_cnst0, ncy_cnst0, ncz_cnst0
+    integer :: ncx_bnry0, ncy_bnry0, ncz_bnry0
 
     ! Coupling CFD boundary condition direction flags
     integer, protected :: &
@@ -221,7 +263,6 @@ module coupler_module
         constraint_NCER = 2,         &
         constraint_Flekkoy = 3,      &
         constraint_CV = 4   
-
 
     !Sendtype flags
     integer, protected :: &
@@ -581,8 +622,7 @@ subroutine create_comm(MPMD_mode)
             ibuf(realm) = myid_world
         endif
 
-        call MPI_allreduce( ibuf ,jbuf, 2, MPI_INTEGER, MPI_MAX, &
-                            CPL_WORLD_COMM, ierr)
+        call MPI_allreduce( ibuf ,jbuf, 2, MPI_INTEGER, MPI_MAX, CPL_WORLD_COMM, ierr)
 
         !Set this largest rank on each process to be the inter-communicators (WHY NOT 0??)
         select case (callingrealm)
@@ -592,8 +632,7 @@ subroutine create_comm(MPMD_mode)
             remote_leader = jbuf(cfd_realm)
         end select
 
-        call MPI_intercomm_create(CPL_REALM_COMM, comm_size - 1, CPL_WORLD_COMM, &
-                                  remote_leader, 1, CPL_INTER_COMM, ierr)
+        call MPI_intercomm_create(CPL_REALM_COMM, comm_size - 1, CPL_WORLD_COMM, remote_leader, 1, CPL_INTER_COMM, ierr)
 
     elseif (MPMD_mode .eq. 0) then
         ! Here we need to open a port and wait for connection from 
@@ -750,6 +789,7 @@ subroutine CPL_finalize(ierr)
         if (CPL_OLAP_COMM .ne. MPI_COMM_NULL) call MPI_COMM_FREE(CPL_OLAP_COMM, ierr)
         if (CPL_CART_COMM .ne. MPI_COMM_NULL) call MPI_COMM_FREE(CPL_CART_COMM, ierr)
         if (CPL_GRAPH_COMM .ne. MPI_COMM_NULL) call MPI_COMM_FREE(CPL_GRAPH_COMM, ierr)
+        if (CPL_REALM_INTERSECTION_COMM .ne. MPI_COMM_NULL) call MPI_COMM_FREE(CPL_REALM_INTERSECTION_COMM, ierr)
     endif
 
     !Deallocate all memory
@@ -832,8 +872,7 @@ subroutine read_coupler_input()
     enddo
 
     !Open and read input file on all processes
-    open(infileid,file='cpl/COUPLER.in',status="old",action="read", &
-                  form="formatted")
+    open(infileid,file='cpl/COUPLER.in',status="old",action="read", form="formatted")
 
     !Possible to specify full overlap so no need for other details
     call locate(infileid, 'FULL_OVERLAP', found)
@@ -899,6 +938,38 @@ subroutine read_coupler_input()
         endif
     endif
 
+    ! Optional periodic overlap-region extent update: 
+    ! every n CFD timesteps, grow (k>0) or shrink (k<0) the overlap region 
+    ! by k CFD cells at both ends of every direction 
+    ! (see CPL_update_overlap_extents).
+    call locate(infileid, 'OVERLAP_UPDATE', found)
+    if (found) then
+        read(infileid,*, IOSTAT=readin) olap_update_n
+        if (readin .ne. 0) then
+            call error_abort("OVERLAP_UPDATE error - could not read n (number of CFD " // &
+                              "timesteps between overlap updates) from coupler input file.")
+        endif
+        read(infileid,*, IOSTAT=readin) olap_update_k
+        if (readin .ne. 0) then
+            call error_abort("OVERLAP_UPDATE error - could not read k (number of CFD " // &
+                              "cells to grow/shrink the overlap region by) from coupler input file.")
+        endif
+        if (olap_update_n .le. 0) then
+            call error_abort("OVERLAP_UPDATE error - n (number of CFD timesteps between " // &
+                              "overlap updates) must be a positive integer.")
+        endif
+        if (olap_update_k .eq. 0) then
+            call error_abort("OVERLAP_UPDATE error - k (cell change per update) must be " // &
+                              "non-zero. Remove the OVERLAP_UPDATE keyword if no periodic " // &
+                              "overlap update is required.")
+        endif
+        olap_update_active = .true.
+    else
+        olap_update_active = .false.
+        olap_update_n = VOID
+        olap_update_k = VOID
+    endif
+    olap_update_step_count = 0
 
     call locate(infileid, 'DENSITY_CFD', found)
     if (found) then
@@ -913,6 +984,14 @@ subroutine read_coupler_input()
     else
         timestep_ratio = VOID
     end if
+
+    ! OVERLAP_UPDATE relies on the CFD and MD realms independently counting
+    ! their own elapsed timesteps and triggering the rebuild in lock-step.
+    if (olap_update_active .and. timestep_ratio .eq. VOID) then
+        call error_abort("OVERLAP_UPDATE error - TIMESTEP_RATIO must also be specified " // &
+                          "in the coupler input file when OVERLAP_UPDATE is used, so that " // &
+                          "CFD and MD realms trigger overlap rebuild on the same simulation step.")
+    endif
     
     call locate(infileid, 'MATCH_CELLSIZE', found)
     if (found) then
@@ -1059,6 +1138,12 @@ subroutine CPL_write_header(header_filename)
         write(infileid,*) 'maximum y cell of overlap region;  jcmax_olap ;', jcmax_olap
         write(infileid,*) 'minimum z cell of overlap region;  kcmin_olap ;', kcmin_olap
         write(infileid,*) 'maximum z cell of overlap region;  kcmax_olap ;', kcmax_olap
+
+        write(infileid,*) 'Periodic overlap update enabled;  olap_update_active ;', olap_update_active
+        if (olap_update_active) then
+            write(infileid,*) 'CFD timesteps between overlap updates;  olap_update_n ;', olap_update_n
+            write(infileid,*) 'CFD cells to grow(+)/shrink(-) overlap by per update;  olap_update_k ;', olap_update_k
+        endif
 
         write(infileid,*) 'MD timesteps per CFD timestep;  timestep_ratio ;', timestep_ratio !TODO name change
         write(infileid,*) 'Enforce cellsize matching;  md_cfd_match_cellsize ;', md_cfd_match_cellsize
@@ -2009,6 +2094,386 @@ subroutine CPL_set_timing(initialstep, nsteps, dt)
 
 end subroutine CPL_set_timing
 
+!=============================================================================
+!                         get_region_fractions                              -
+!-----------------------------------------------------------------------------
+subroutine get_region_fractions(icmin_r, icmax_r, jcmin_r, jcmax_r, kcmin_r, kcmax_r, &
+                                 fimin, fimax, fjmin, fjmax, fkmin, fkmax)
+!
+! Express a sub-region's cell bounds (icmin_r..kcmax_r) as fractions of
+! ORIGINAL overlap band (icmin_olap0..kcmax_olap0), in each direction:
+! fraction 0 sits at the lower overlap bound, fraction 1 at the upper
+! overlap bound. Called once, from CPL_create_map, for the constrained-
+! dynamics region (icmin_cnst etc.) and, separately, for the boundary
+! region (icmin_bnry etc.), so their relative geometry within the overlap
+! band can be preserved later by rescale_region_to_olap.
+!
+    implicit none
+
+    integer, intent(in)           :: icmin_r, icmax_r, jcmin_r, jcmax_r, kcmin_r, kcmax_r
+    real(kind(0.d0)), intent(out) :: fimin, fimax, fjmin, fjmax, fkmin, fkmax
+
+    fimin = safe_frac(icmin_r, icmin_olap0, icmax_olap0)
+    fimax = safe_frac(icmax_r, icmin_olap0, icmax_olap0)
+    fjmin = safe_frac(jcmin_r, jcmin_olap0, jcmax_olap0)
+    fjmax = safe_frac(jcmax_r, jcmin_olap0, jcmax_olap0)
+    fkmin = safe_frac(kcmin_r, kcmin_olap0, kcmax_olap0)
+    fkmax = safe_frac(kcmax_r, kcmin_olap0, kcmax_olap0)
+
+contains
+
+    function safe_frac(v, lo, hi) result(f)
+        implicit none
+        integer, intent(in) :: v, lo, hi
+        real(kind(0.d0))    :: f
+
+        ! Guard against a zero-thickness original overlap in this direction
+        ! (division by zero); pin the fraction to the lower bound instead.
+        if (hi .eq. lo) then
+            f = 0.d0
+        else
+            f = dble(v - lo) / dble(hi - lo)
+        endif
+
+    end function safe_frac
+
+end subroutine get_region_fractions
+
+
+!=============================================================================
+!                        rescale_region_to_olap                             -
+!-----------------------------------------------------------------------------
+subroutine rescale_region_to_olap(fimin, fimax, fjmin, fjmax, fkmin, fkmax, &
+                                   icmin_r, icmax_r, jcmin_r, jcmax_r, kcmin_r, kcmax_r, &
+                                   label)
+!
+! Given fractional positions (ORIGINAL overlap band)
+! and the CURRENT overlap extents (icmin_olap..kcmax_olap), 
+! recompute a sub-region's cell bounds so that
+! it keeps the same relative size within the overlap band. 
+! Used by CPL_update_overlap_extents to move/resize
+! the constrained and boundary regions in step with the overlap.
+
+    implicit none
+
+    real(kind(0.d0)), intent(in)    :: fimin, fimax, fjmin, fjmax, fkmin, fkmax
+    integer, intent(inout)          :: icmin_r, icmax_r, jcmin_r, jcmax_r, kcmin_r, kcmax_r
+    character(len=*), intent(in)    :: label
+
+    icmin_r = icmin_olap + nint(fimin * dble(icmax_olap - icmin_olap))
+    icmax_r = icmin_olap + nint(fimax * dble(icmax_olap - icmin_olap))
+    jcmin_r = jcmin_olap + nint(fjmin * dble(jcmax_olap - jcmin_olap))
+    jcmax_r = jcmin_olap + nint(fjmax * dble(jcmax_olap - jcmin_olap))
+    kcmin_r = kcmin_olap + nint(fkmin * dble(kcmax_olap - kcmin_olap))
+    kcmax_r = kcmin_olap + nint(fkmax * dble(kcmax_olap - kcmin_olap))
+
+    ! Clamp into the (new) overlap bounds -- rounding can push a bound out
+    ! by a cell when the region sat exactly on the old overlap's edge
+    icmin_r = max(icmin_olap, min(icmax_olap, icmin_r))
+    icmax_r = max(icmin_olap, min(icmax_olap, icmax_r))
+    jcmin_r = max(jcmin_olap, min(jcmax_olap, jcmin_r))
+    jcmax_r = max(jcmin_olap, min(jcmax_olap, jcmax_r))
+    kcmin_r = max(kcmin_olap, min(kcmax_olap, kcmin_r))
+    kcmax_r = max(kcmin_olap, min(kcmax_olap, kcmax_r))
+
+    if (icmin_r .gt. icmax_r .or. jcmin_r .gt. jcmax_r .or. kcmin_r .gt. kcmax_r) then
+        call error_abort("CPL_update_overlap_extents error - rescaling the " // &
+                          trim(label) // " region to the new overlap extents produced " // &
+                          "an invalid (lower limit greater than upper limit) range. " // &
+                          "Aborting simulation.")
+    endif
+
+end subroutine rescale_region_to_olap
+
+
+!=============================================================================
+!                        check_region_min_size                              -
+!-----------------------------------------------------------------------------
+subroutine check_region_min_size(icmin_r, icmax_r, jcmin_r, jcmax_r, kcmin_r, kcmax_r, ncx0, ncy0, ncz0, label)
+!
+! Aborts the simulation if a rescaled sub-region 
+! has shrunk to one CFD cell or less in any direction.
+
+! ncx0, ncy0, ncz0 are the region's original cell counts in x, y, z.
+
+! A direction that was already exactly one cell thick to begin with
+! is left alone here -- it is not shrinking, it was simply configured that way. 
+
+! Only a genuine crossing from more than one cell down to one cell or less is treated as an error.
+
+    implicit none
+
+    integer, intent(in)          :: icmin_r, icmax_r, jcmin_r, jcmax_r, kcmin_r, kcmax_r
+    integer, intent(in)          :: ncx0, ncy0, ncz0
+    character(len=*), intent(in) :: label
+
+    integer :: ncx_new, ncy_new, ncz_new
+
+    ncx_new = icmax_r - icmin_r + 1
+    ncy_new = jcmax_r - jcmin_r + 1
+    ncz_new = kcmax_r - kcmin_r + 1
+
+    if ((ncx_new .le. 1 .and. ncx0 .gt. 1) .or. &
+        (ncy_new .le. 1 .and. ncy0 .gt. 1) .or. &
+        (ncz_new .le. 1 .and. ncz0 .gt. 1)) then
+        print'(a,3i8,a,3i8)', 'CPL_update_overlap_extents - new '// trim(label) //   &
+                         ' region cell counts (x,y,z) = ', ncx_new, ncy_new, ncz_new, &
+                         ' (originally = )', ncx0, ncy0, ncz0
+        call error_abort("CPL_update_overlap_extents error - the " // trim(label) // &
+                          " region has shrunk to one CFD cell (or less) in a direction " // &
+                          "where it was originally more than one cell thick. " // &
+                          "Aborting simulation.")
+    endif
+
+end subroutine check_region_min_size
+
+
+!=============================================================================
+!                       CPL_update_overlap_extents                          -
+!-----------------------------------------------------------------------------
+subroutine CPL_update_overlap_extents()
+!
+! Periodically grows or shrinks the overlap region extents
+! while the simulation is running, 
+! and fully rebuilds the overlap communicators,
+! rank maps and graph topology to match.
+!
+! This must be called by both the realms.
+!
+! Rebuilding the overlap communicators involves
+! collective MPI calls (MPI_Comm_split, MPI_Comm_free, MPI_Graph_create, MPI_Allgather) 
+! across CPL_WORLD_COMM, which every process in both the CFD and the MD realm must enter together. 
+
+! Both realms independently count their own elapsed timesteps and trigger
+! the rebuild after the same simulated interval, using the CFD-vs-MD timestep ratio 
+! rather than any new message exchange.
+!
+!**Synopsis**
+!
+!.. code-block:: fortran
+!
+!  CPL_update_overlap_extents()
+!
+!**Behavior**
+!
+! Controlled by the OVERLAP_UPDATE keyword in cpl/COUPLER.in (which
+! requires TIMESTEP_RATIO to also be set):
+!
+!.. code-block:: fortran
+!
+!  OVERLAP_UPDATE
+!  n     ! number of CFD timesteps between updates
+!  k     ! number of CFD cells to grow(+)/shrink(-) the overlap region by
+!
+! If OVERLAP_UPDATE is absent, this routine returns immediately and does
+! nothing, so it is always safe to call every timestep regardless of
+! whether the feature is switched on.
+!
+! Every n CFD timesteps (equivalently, every n*TIMESTEP_RATIO MD
+! timesteps), the overlap region bounds are shifted symmetrically:
+!
+!   icmin_olap = icmin_olap - k     icmax_olap = icmax_olap + k
+!   jcmin_olap = jcmin_olap - k     jcmax_olap = jcmax_olap + k
+!   kcmin_olap = kcmin_olap - k     kcmax_olap = kcmax_olap + k
+!
+! A positive k therefore GROWS the overlap region by k CFD cells at both
+! ends of every direction (2k cells in total per direction); a negative
+! k SHRINKS it in the same way. Since dx, dy and dz are the (fixed) CFD
+! cell sizes, the physical change in extent every n*dt is k*dx, k*dy and
+! k*dz in x, y and z respectively.
+!
+! Once new extents are computed (identically on both realms, since both
+! read the same COUPLER.in), and pass all sanity checks below, this
+! routine:
+!
+!   1. Frees the existing CPL_OLAP_COMM, CPL_REALM_INTERSECTION_COMM and
+!      CPL_GRAPH_COMM communicators, so they are not leaked.
+!   2. Re-runs: check_config_feasibility(), get_md_cell_ranges(),
+!      get_overlap_blocks(), prepare_overlap_comms(), set_overlap_topology()
+!      -- exactly the same steps CPL_create_map ran at start-up -- 
+!      so that olap_mask, cfd_icoord2olap_md_icoords/jcoords/kcoords,
+!      CPL_OLAP_COMM, CPL_REALM_INTERSECTION_COMM, CPL_GRAPH_COMM and the
+!      rank_*2rank_* mapping arrays all reflect the new overlap region.
+!
+! The simulation is aborted if:
+!   - CPL_create_map has not yet been called (nothing to rebuild yet);
+!   - the overlap region would shrink to one CFD cell or less in any direction;
+!   - the lower limit would end up greater than the upper limit in any direction;
+!   - the updated extents would contain a negative cell index;
+!   - the updated extents would extend outside of the global CFD domain;
+!   - the updated overlap region would become larger than the MD domain;
+!   - any of the re-run feasibility/consistency checks inside check_config_feasibility() fail for the new extents.
+
+    use mpi
+    implicit none
+
+    integer :: new_icmin, new_icmax, new_jcmin, new_jcmax, new_kcmin, new_kcmax
+    integer :: my_trigger_steps
+    logical :: do_rebuild
+
+    ! Do nothing if the feature has not been switched on in COUPLER.in
+    if (.not. olap_update_active) return
+
+    if (.not. CPL_map_created) then
+        call error_abort("CPL_update_overlap_extents error - CPL_create_map has not " // &
+                          "been called yet; there is no overlap map/communicator to " // &
+                          "rebuild. Call CPL_create_map once at start-up before calling " // &
+                          "CPL_update_overlap_extents.")
+    endif
+
+    ! Count elapsed timesteps of the calling realm since the last update.
+    ! CFD triggers every olap_update_n of its own (CFD) timesteps;
+    ! MD triggers every olap_update_n*timestep_ratio of its own timesteps,
+    ! i.e. after the same simulated interval.
+
+    olap_update_step_count = olap_update_step_count + 1
+
+    if (realm .eq. cfd_realm) then
+        my_trigger_steps = olap_update_n
+    elseif (realm .eq. md_realm) then
+        my_trigger_steps = olap_update_n * timestep_ratio
+    else
+        call error_abort("CPL_update_overlap_extents error - called from a process " // &
+                          "that is neither the CFD nor the MD realm.")
+    endif
+
+    do_rebuild = (mod(olap_update_step_count, my_trigger_steps) .eq. 0)
+    if (.not. do_rebuild) return
+    olap_update_step_count = 0
+
+    ! Candidate new extents (symmetric shift by k cells in every direction)
+    new_icmin = icmin_olap - olap_update_k; new_icmax = icmax_olap + olap_update_k
+    new_jcmin = jcmin_olap - olap_update_k; new_jcmax = jcmax_olap + olap_update_k
+    new_kcmin = kcmin_olap - olap_update_k; new_kcmax = kcmax_olap + olap_update_k
+
+    ! ---- Sanity checks before committing the new extents ----
+
+    ! Abort if any direction has shrunk to (or below) a single CFD cell
+    if ((new_icmax - new_icmin + 1) .le. 1 .or. &
+        (new_jcmax - new_jcmin + 1) .le. 1 .or. &
+        (new_kcmax - new_kcmin + 1) .le. 1) then
+        print'(a,3i8)', 'CPL_update_overlap_extents - new overlap cell counts (x,y,z) = ', &
+                          new_icmax-new_icmin+1, new_jcmax-new_jcmin+1, new_kcmax-new_kcmin+1
+        call error_abort("CPL_update_overlap_extents error - overlap region has shrunk " // &
+                          "to one CFD cell (or less) in at least one direction. " // &
+                          "Aborting simulation.")
+    endif
+
+    ! Abort if lower limit has crossed above upper limit in any direction
+    if (new_icmin .gt. new_icmax .or. new_jcmin .gt. new_jcmax .or. &
+        new_kcmin .gt. new_kcmax) then
+        call error_abort("CPL_update_overlap_extents error - overlap region lower limit " // &
+                          "is greater than the upper limit after update. Aborting simulation.")
+    endif
+
+    ! Abort if new extents contain a negative cell index
+    if (new_icmin .lt. 0 .or. new_icmax .lt. 0 .or. new_jcmin .lt. 0 .or. &
+        new_jcmax .lt. 0 .or. new_kcmin .lt. 0 .or. new_kcmax .lt. 0) then
+        call error_abort("CPL_update_overlap_extents error - overlap region contains a " // &
+                          "negative cell index after update. Aborting simulation.")
+    endif
+
+    ! Abort if new extents have grown outside of the global CFD domain
+    if (new_icmin .lt. icmin .or. new_icmax .gt. icmax .or. &
+        new_jcmin .lt. jcmin .or. new_jcmax .gt. jcmax .or. &
+        new_kcmin .lt. kcmin .or. new_kcmax .gt. kcmax) then
+        print'(a,6i10)', 'CFD domain cell extents (icmin,icmax,jcmin,jcmax,kcmin,kcmax) = ', &
+                          icmin, icmax, jcmin, jcmax, kcmin, kcmax
+        print'(a,6i10)', 'Requested overlap extents                                     = ', &
+                          new_icmin, new_icmax, new_jcmin, new_jcmax, new_kcmin, new_kcmax
+        call error_abort("CPL_update_overlap_extents error - updated overlap region " // &
+                          "extends outside of the global CFD domain. Aborting simulation.")
+    endif
+
+    ! Abort if the overlap region would grow larger than the MD domain
+    if (xL_md .lt. ((new_icmax-new_icmin+1)*dx - dx/2.d0) .or. &
+        yL_md .lt. ((new_jcmax-new_jcmin+1)*dy - dy/2.d0) .or. &
+        zL_md .lt. ((new_kcmax-new_kcmin+1)*dz - dz/2.d0)) then
+        call error_abort("CPL_update_overlap_extents error - updated overlap region " // &
+                          "is now larger than the MD region. Aborting simulation.")
+    endif
+
+    ! ---- All checks passed: commit the new extents ----
+    icmin_olap = new_icmin; icmax_olap = new_icmax
+    jcmin_olap = new_jcmin; jcmax_olap = new_jcmax
+    kcmin_olap = new_kcmin; kcmax_olap = new_kcmax
+
+    ncx_olap = icmax_olap - icmin_olap + 1
+    ncy_olap = jcmax_olap - jcmin_olap + 1
+    ncz_olap = kcmax_olap - kcmin_olap + 1
+
+    xL_olap = ncx_olap * dx
+    yL_olap = ncy_olap * dy
+    zL_olap = ncz_olap * dz
+
+    if (rank_realm .eq. rootid_realm .and. (output_mode .ne. QUIET)) then
+        print'(a,6i8)', 'CPL: overlap region updated, new extents ' // &
+                         '(icmin,icmax,jcmin,jcmax,kcmin,kcmax) = ', &
+                          icmin_olap, icmax_olap, jcmin_olap, jcmax_olap, kcmin_olap, kcmax_olap
+    endif
+
+    ! ---- Rescale the constrained and boundary regions so they  ----
+    ! ---- keep the same relative position/size within the overlap band  ----
+    if (constraint_algo .ne. 0) then
+        call rescale_region_to_olap(frac_icmin_cnst, frac_icmax_cnst, &
+                                     frac_jcmin_cnst, frac_jcmax_cnst, &
+                                     frac_kcmin_cnst, frac_kcmax_cnst, &
+                                     icmin_cnst, icmax_cnst, jcmin_cnst, jcmax_cnst, &
+                                     kcmin_cnst, kcmax_cnst, "constrained")
+        call check_region_min_size(icmin_cnst, icmax_cnst, jcmin_cnst, jcmax_cnst, &
+                                    kcmin_cnst, kcmax_cnst, &
+                                    ncx_cnst0, ncy_cnst0, ncz_cnst0, "constrained")
+        if (rank_realm .eq. rootid_realm .and. (output_mode .ne. QUIET)) then
+            print'(a,6i8)', 'CPL: constrained region rescaled, new extents ' // &
+                             '(icmin,icmax,jcmin,jcmax,kcmin,kcmax) = ', &
+                              icmin_cnst, icmax_cnst, jcmin_cnst, jcmax_cnst, kcmin_cnst, kcmax_cnst
+        endif
+    endif
+
+    if (boundary_algo .eq. 1) then
+        call rescale_region_to_olap(frac_icmin_bnry, frac_icmax_bnry, &
+                                     frac_jcmin_bnry, frac_jcmax_bnry, &
+                                     frac_kcmin_bnry, frac_kcmax_bnry, &
+                                     icmin_bnry, icmax_bnry, jcmin_bnry, jcmax_bnry, &
+                                     kcmin_bnry, kcmax_bnry, "boundary")
+        call check_region_min_size(icmin_bnry, icmax_bnry, jcmin_bnry, jcmax_bnry, &
+                                    kcmin_bnry, kcmax_bnry, &
+                                    ncx_bnry0, ncy_bnry0, ncz_bnry0, "boundary")
+        if (rank_realm .eq. rootid_realm .and. (output_mode .ne. QUIET)) then
+            print'(a,6i8)', 'CPL: boundary region rescaled, new extents ' // &
+                             '(icmin,icmax,jcmin,jcmax,kcmin,kcmax) = ', &
+                              icmin_bnry, icmax_bnry, jcmin_bnry, jcmax_bnry, kcmin_bnry, kcmax_bnry
+        endif
+    endif
+
+    ! ---- Rebuild the overlap communicators, rank maps and topology ----
+
+    call MPI_Barrier(CPL_WORLD_COMM, ierr)
+
+    ! Free the old overlap communicators before they are overwritten.
+
+    if (CPL_OLAP_COMM .ne. MPI_COMM_NULL) call MPI_COMM_FREE(CPL_OLAP_COMM, ierr)
+    if (CPL_REALM_INTERSECTION_COMM .ne. MPI_COMM_NULL) &
+        call MPI_COMM_FREE(CPL_REALM_INTERSECTION_COMM, ierr)
+    if (CPL_GRAPH_COMM .ne. MPI_COMM_NULL) call MPI_COMM_FREE(CPL_GRAPH_COMM, ierr)
+
+    ! Re-run the same steps CPL_create_map used at start-up, now that
+    ! icmin_olap..kcmax_olap (and ncx/y/z_olap, xL/yL/zL_olap) hold the new
+    ! extents.
+
+    call check_config_feasibility()
+    call get_md_cell_ranges()
+    call get_overlap_blocks()
+    call prepare_overlap_comms()
+    call set_overlap_topology()
+
+    call MPI_Barrier(CPL_WORLD_COMM, ierr)
+
+    if (rank_realm .eq. rootid_realm .and. (output_mode .ne. QUIET)) then
+        print*, 'CPL: overlap communicators, rank maps and topology rebuilt.'
+    endif
+
+end subroutine CPL_update_overlap_extents
 
 !=============================================================================
 subroutine CPL_create_map()
@@ -2044,7 +2509,48 @@ subroutine CPL_create_map()
     ! Setup graph topology
     call set_overlap_topology()
 
-contains
+    ! Record the original overlap extents, and (if active) the relative
+    ! position of the constrained and boundary regions within the
+    ! overlap band, so CPL_update_overlap_extents can preserve the same
+    ! relative geometry if/when the overlap region is resized later.
+    icmin_olap0 = icmin_olap; icmax_olap0 = icmax_olap
+    jcmin_olap0 = jcmin_olap; jcmax_olap0 = jcmax_olap
+    kcmin_olap0 = kcmin_olap; kcmax_olap0 = kcmax_olap
+
+    if (constraint_algo .ne. 0) then
+        call get_region_fractions(icmin_cnst, icmax_cnst, jcmin_cnst, jcmax_cnst, kcmin_cnst, kcmax_cnst, &
+                                   frac_icmin_cnst, frac_icmax_cnst, &
+                                   frac_jcmin_cnst, frac_jcmax_cnst, &
+                                   frac_kcmin_cnst, frac_kcmax_cnst)
+        ncx_cnst0 = icmax_cnst - icmin_cnst + 1
+        ncy_cnst0 = jcmax_cnst - jcmin_cnst + 1
+        ncz_cnst0 = kcmax_cnst - kcmin_cnst + 1
+    endif
+ 
+    if (boundary_algo .eq. 1) then
+        call get_region_fractions(icmin_bnry, icmax_bnry, jcmin_bnry, jcmax_bnry, kcmin_bnry, kcmax_bnry, &
+                                   frac_icmin_bnry, frac_icmax_bnry, &
+                                   frac_jcmin_bnry, frac_jcmax_bnry, &
+                                   frac_kcmin_bnry, frac_kcmax_bnry)
+        ncx_bnry0 = icmax_bnry - icmin_bnry + 1
+        ncy_bnry0 = jcmax_bnry - jcmin_bnry + 1
+        ncz_bnry0 = kcmax_bnry - kcmin_bnry + 1
+    endif
+    
+    ! Record that the overlap map/communicators now exist, so
+    ! CPL_update_overlap_extents knows it is safe to rebuild them later
+    CPL_map_created = .true.
+
+end subroutine CPL_create_map
+
+!=============================================================================
+! The five routines below were originally internal procedures of CPL_create_map. 
+! They are now module-level siblings so that CPL_update_overlap_extents can call them again later
+! to rebuild the overlap communicators/topology/mapping arrays. 
+! Their logic is otherwise unchanged from the original, 
+! except that each array they allocate is now guarded with "if (allocated(...)) deallocate(...)" 
+! so that calling them a subsequent time is safe.
+!-----------------------------------------------------------------------------
 
 subroutine check_config_feasibility()
     implicit none
@@ -2280,6 +2786,13 @@ subroutine get_md_cell_ranges()
     integer :: ncz_mdonly, ncz_md, nczP_md
     integer :: funit
 
+    if (allocated(icPmin_md)) deallocate(icPmin_md)
+    if (allocated(jcPmin_md)) deallocate(jcPmin_md)
+    if (allocated(kcPmin_md)) deallocate(kcPmin_md)
+    if (allocated(icPmax_md)) deallocate(icPmax_md)
+    if (allocated(jcPmax_md)) deallocate(jcPmax_md)
+    if (allocated(kcPmax_md)) deallocate(kcPmax_md)
+
     allocate(icPmin_md(npx_md)); icPmin_md = VOID
     allocate(jcPmin_md(npy_md)); jcPmin_md = VOID
     allocate(kcPmin_md(npz_md)); kcPmin_md = VOID
@@ -2468,6 +2981,9 @@ subroutine get_overlap_blocks()
     endif
 
     !Get cartesian coordinate of overlapping md cells & cfd cells
+    if (allocated(cfd_icoord2olap_md_icoords)) deallocate(cfd_icoord2olap_md_icoords)
+    if (allocated(cfd_jcoord2olap_md_jcoords)) deallocate(cfd_jcoord2olap_md_jcoords)
+    if (allocated(cfd_kcoord2olap_md_kcoords)) deallocate(cfd_kcoord2olap_md_kcoords)
     allocate(cfd_icoord2olap_md_icoords(npx_cfd,nolapsx)) 
     allocate(cfd_jcoord2olap_md_jcoords(npy_cfd,nolapsy)) 
     allocate(cfd_kcoord2olap_md_kcoords(npz_cfd,nolapsz)) 
@@ -2699,6 +3215,7 @@ subroutine prepare_overlap_comms()
     tempsize = size(cfd_kcoord2olap_md_kcoords,2)
     allocate(mdkcoords(tempsize))
 
+    if (allocated(olap_mask)) deallocate(olap_mask)
     allocate(olap_mask(nproc_world))
 
     !Set default values, must be done because coord2rank_md cannot
@@ -2914,8 +3431,6 @@ subroutine print_overlap_comms
     end if
     
 end subroutine print_overlap_comms
-
-end subroutine CPL_create_map
 
 !-------------------------------------------------------------------
 !                   CPL_rank_map                                   -
