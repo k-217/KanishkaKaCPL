@@ -2448,22 +2448,24 @@ subroutine CPL_update_overlap_extents()
 
     ! ---- Rebuild the overlap communicators, rank maps and topology ----
 
-    call MPI_Barrier(CPL_WORLD_COMM, ierr)
+    call check_config_feasibility()
+    call get_md_cell_ranges()
+    call get_overlap_blocks()
 
-    ! Free the old overlap communicators before they are overwritten.
+    if (nproc_cfd .eq. 1 .and. nproc_md .eq. 1) then
+        if (rank_realm .eq. rootid_realm .and. (output_mode .ne. QUIET)) then
+            print*, 'CPL: single CFD/MD process pair -- overlap communicators unchanged, skipping rebuild.'
+        endif
+        return
+    endif
+
+    call MPI_Barrier(CPL_WORLD_COMM, ierr)
 
     if (CPL_OLAP_COMM .ne. MPI_COMM_NULL) call MPI_COMM_FREE(CPL_OLAP_COMM, ierr)
     if (CPL_REALM_INTERSECTION_COMM .ne. MPI_COMM_NULL) &
         call MPI_COMM_FREE(CPL_REALM_INTERSECTION_COMM, ierr)
     if (CPL_GRAPH_COMM .ne. MPI_COMM_NULL) call MPI_COMM_FREE(CPL_GRAPH_COMM, ierr)
 
-    ! Re-run the same steps CPL_create_map used at start-up, now that
-    ! icmin_olap..kcmax_olap (and ncx/y/z_olap, xL/yL/zL_olap) hold the new
-    ! extents.
-
-    call check_config_feasibility()
-    call get_md_cell_ranges()
-    call get_overlap_blocks()
     call prepare_overlap_comms()
     call set_overlap_topology()
 
