@@ -1,0 +1,202 @@
+/*
+
+    ________/\\\\\\\\\__/\\\\\\\\\\\\\____/\\\_____________        
+     _____/\\\////////__\/\\\/////////\\\_\/\\\_____________       
+      ___/\\\/___________\/\\\_______\/\\\_\/\\\_____________      
+       __/\\\_____________\/\\\\\\\\\\\\\/__\/\\\_____________     
+        _\/\\\_____________\/\\\/////////____\/\\\_____________    
+         _\//\\\____________\/\\\_____________\/\\\_____________   
+          __\///\\\__________\/\\\_____________\/\\\_____________  
+           ____\////\\\\\\\\\_\/\\\_____________\/\\\\\\\\\\\\\\\_ 
+            _______\/////////__\///______________\///////////////__
+
+
+                         C P L  -  L I B R A R Y 
+
+           Copyright (C) 2012-2015 Edward Smith & David Trevelyan
+
+License
+
+    This file is part of CPL-Library.
+
+    CPL-Library is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    CPL-Library is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with CPL-Library.  If not, see <http://www.gnu.org/licenses/>.
+
+Description
+
+    "Socket" class for interfacing with CPL-Library. 
+
+*/
+#ifndef CPLSocketFOAM_H
+#define CPLSocketFOAM_H
+
+#include <vector>
+#include <memory>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <string>
+
+
+#include "mpi.h"
+#include "fvCFD.H"
+#include "error.H"
+#include "meshSearch.H"
+
+#include "cpl/CPL_ndArray.h"
+#include "cpl/cpl.h"
+
+//Check if file exists
+inline bool file_exists (const std::string& name) {
+  struct stat buffer;   
+  return (stat (name.c_str(), &buffer) == 0); 
+}
+
+// Nearest integer
+int nint(double d)
+{
+    return std::floor(d+0.5);
+}
+
+class CPLSocketFOAM
+{   
+
+public:
+    
+    // Construct from no arguments 
+    CPLSocketFOAM() : olapRegion(6),  velBCRegion(6),  cnstFRegion(6),
+                      olapPortion(6), velBCPortion(6), cnstFPortion(6), myCoords(3) {}
+    
+    // Invoke CPL_Library and store CFD realm communicator
+    void initComms(int& argc, char**& argv);
+    void finalize();
+
+    // Analyse topology and perform CFD-side initialisation
+    void initCFD (const Foam::Time &runTime, const Foam::fvMesh &mesh);
+    void init2pCFD (const Foam::Time &runTime, const Foam::fvMesh &mesh);
+
+    void getCellTopology();
+    void allocateBuffers(int);
+
+    // Pack and unpack data into CPL-Library formats
+    void packStress(volVectorField &U, dimensionedScalar &nu, fvMesh &mesh);
+    double unpackVelocity(volVectorField &U, fvMesh &mesh);
+    double unpackTwoPhase(volVectorField &U, volVectorField &delU, volScalarField &alpha1, const dimensionedScalar &rho1, const dimensionedScalar &rho2, fvMesh &mesh);
+    double unpackVelocityPressure(volVectorField &U, volScalarField &p, fvMesh &mesh);
+    void pack(volVectorField &U, volScalarField &p, dimensionedScalar &nu, fvMesh &mesh, int);
+    void pack(volVectorField &U, volScalarField &p, volScalarField &alpha, volScalarField &nu, fvMesh &mesh, int);
+    double unpackPorousForce(volVectorField &F, volScalarField &eps, fvMesh &mesh);
+    double unpackPorousVelForceCoeff(volVectorField &U,volVectorField &F, 
+                                     volScalarField &Fcoeff, volScalarField &eps, 
+                                     scalar maxPossibleAlpha, fvMesh &mesh);
+    volVectorField divideFieldsVectorbyScalar(volVectorField &F, volScalarField &eps, fvMesh &mesh);
+
+    // Send and receive the data with CPL-Library
+    void sendStress();
+    void recvVelocity();
+    void recvVelocityPressure();
+    void recvTwoPhase();
+    void send();
+    void recv();
+
+	//meshSearch local search for points in a mesh
+	Foam::meshSearch* meshSearcher;
+
+    //Foam class which wraps bool to check if
+    // boundary value set or intepolated using 1st
+    // cell inside the domain
+    Foam::Switch interp_BC;
+
+    //Bitwise mask coefficients
+    int const VEL = 1; // 2^0, bit 0
+    int const PRESSURE = 2;  // 2^1, bit 1
+    int const GRADPRESSURE = 4;  // 2^2, bit 2
+    int const STRESS = 8;  // 2^3, bit 3
+    int const DIVSTRESS = 16;  // 2^4, bit 4
+    int const ALPHA = 32;
+    int const DEBUG = 0;
+
+	~CPLSocketFOAM() {
+		delete meshSearcher;
+	}
+
+
+private:
+
+
+    // Number of processors in x, y and z directions, and periodicity
+    int npxyz[3]; 
+    int nprocs;
+    int periods[3];
+
+    // Domain dimensions
+    double xyzL[3];
+
+    // Number of cells globally in CFD domain 
+    int ncxyz[3];
+
+    // Size of the cells in each direction
+    double dx, dy, dz;
+
+    // Density of the fluid assumed by CPL
+    double CPLDensity;
+
+    // Communicators for use with CPL_Library 
+    MPI_Comm realmComm; 
+    MPI_Comm cartComm; 
+
+    // Rank of this processor in cartComm 
+    int rankRealm;
+    int rankCart;
+
+    // Coordinates of the local processor
+    std::vector<int> myCoords;
+    // Data to be sent/received with CPL-Library
+    CPL::ndArray<double> sendBuf;
+    CPL::ndArray<double> recvBuf;
+    CPL::ndArray<double> sendStressBuff;
+    CPL::ndArray<double> recvVelocityBuff;
+    CPL::ndArray<double> recvTwoPhaseBuff;
+
+    // Region cell limits
+    std::vector<int> olapRegion;
+    std::vector<int> velBCRegion;
+    std::vector<int> cnstFRegion;
+
+    // Portions of the region in the local processor
+    std::vector<int> olapPortion;
+    std::vector<int> velBCPortion;
+    std::vector<int> cnstFPortion;
+
+//    int writetime;
+//    int packcount=0;
+//    void createFields(const Foam::Time &runTime, 
+//                      const Foam::fvMesh &mesh);
+//    std::shared_ptr<Foam::volVectorField> dPdr;
+
+   
+    // Number of cells in the portion in a region
+    int olapCells[3];
+    int velBCCells[3];
+    int cnstFCells[3];
+
+    //Size of different possible passing variables
+    int const VELSIZE = 3;  // 3 velocity components
+    int const PRESSURESIZE = 1;  // 1 pressure
+    int const GRADPRESSURESIZE = 3;  // 3 grad(P)
+    int const STRESSSIZE = 9;  // 9 stress
+    int const DIVSTRESSSIZE = 3;  // 3 div(stress)
+
+};
+
+
+#endif

@@ -1,0 +1,8 @@
+CPLphaseChangeHeatFoam.C
+twoPhaseMixtureI/twoPhaseMixtureI.C
+phaseChangeTwoPhaseMixtures/phaseChangeTwoPhaseMixture/phaseChangeTwoPhaseMixture.C
+phaseChangeTwoPhaseMixtures/phaseChangeTwoPhaseMixture/newPhaseChangeTwoPhaseMixture.C
+phaseChangeTwoPhaseMixtures/Lee/Lee.C
+phaseChangeTwoPhaseMixtures/Hardt/Hardt.C
+
+EXE = $(FOAM_CPL_APP_BIN)/CPLphaseChangeHeatFoam
